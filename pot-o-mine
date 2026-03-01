@@ -1,0 +1,537 @@
+#!/usr/bin/env bash
+# ──────────────────────────────────────────────────────────────────────────────
+# pot-o-mine  –  PoT-O Desktop Miner CLI
+# Connects to the PoT-O RPC validator, fetches challenges, mines locally,
+# and submits proofs. Implements the full PoT-O mining algorithm:
+#   tensor ops → MML compression score → neural path matching → proof hash.
+#
+# Requirements: bash 4+, curl, jq, python3 (with standard library)
+# Usage:        ./pot-o-mine [options]
+# ──────────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+RPC_URL="${POT_RPC_URL:-https://pot.rpc.gateway.tribewarez.com}"
+MINER_PUBKEY="${POT_MINER_PUBKEY:-$(hostname)-$(whoami)-$(date +%s)}"
+MAX_ITERATIONS="${POT_MAX_ITERATIONS:-10000}"
+MAX_TENSOR_DIM="${POT_MAX_TENSOR_DIM:-256}"
+LOOP_DELAY="${POT_LOOP_DELAY:-2}"
+DEVICE_TYPE="native"
+VERBOSE="${POT_VERBOSE:-0}"
+
+# Stats
+STAT_CHALLENGES=0
+STAT_PROOFS_FOUND=0
+STAT_PROOFS_SUBMITTED=0
+STAT_PROOFS_ACCEPTED=0
+START_TIME=$(date +%s)
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# ── Usage ────────────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<EOF
+${BOLD}pot-o-mine${NC} v${VERSION} – PoT-O Desktop Miner CLI
+
+${BOLD}USAGE:${NC}
+    pot-o-mine [OPTIONS]
+
+${BOLD}OPTIONS:${NC}
+    -r, --rpc URL          RPC endpoint (default: \$POT_RPC_URL or https://pot.rpc.gateway.tribewarez.com)
+    -k, --pubkey KEY       Miner public key / identity
+    -i, --iterations N     Max nonce iterations per challenge (default: 10000)
+    -d, --dim N            Max tensor dimension (default: 256)
+    -D, --delay SECS       Delay between mining cycles (default: 2)
+    -1, --once             Mine a single challenge then exit
+    -s, --status           Print RPC status and exit
+    -v, --verbose          Verbose output
+    -h, --help             Show this help
+
+${BOLD}ENVIRONMENT:${NC}
+    POT_RPC_URL            RPC endpoint
+    POT_MINER_PUBKEY       Miner identity
+    POT_MAX_ITERATIONS     Max iterations
+    POT_MAX_TENSOR_DIM     Max tensor dimension
+    POT_LOOP_DELAY         Cycle delay
+    POT_VERBOSE            Verbose mode (1/0)
+
+${BOLD}EXAMPLES:${NC}
+    pot-o-mine                                    # Mine continuously
+    pot-o-mine --rpc http://localhost:8900 --once  # Single challenge on local RPC
+    pot-o-mine --status                           # Show validator status
+    pot-o-mine -k my_wallet_pubkey -i 50000       # Mine with custom key & iterations
+EOF
+    exit 0
+}
+
+# ── Argument parsing ─────────────────────────────────────────────────────────
+
+ONCE=0
+STATUS_ONLY=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -r|--rpc)       RPC_URL="$2"; shift 2 ;;
+        -k|--pubkey)    MINER_PUBKEY="$2"; shift 2 ;;
+        -i|--iterations) MAX_ITERATIONS="$2"; shift 2 ;;
+        -d|--dim)       MAX_TENSOR_DIM="$2"; shift 2 ;;
+        -D|--delay)     LOOP_DELAY="$2"; shift 2 ;;
+        -1|--once)      ONCE=1; shift ;;
+        -s|--status)    STATUS_ONLY=1; shift ;;
+        -v|--verbose)   VERBOSE=1; shift ;;
+        -h|--help)      usage ;;
+        *)              echo "Unknown option: $1"; usage ;;
+    esac
+done
+
+# ── Dependency check ─────────────────────────────────────────────────────────
+
+check_deps() {
+    local missing=()
+    for cmd in curl jq python3; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing+=("$cmd")
+        fi
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo -e "${RED}Missing dependencies: ${missing[*]}${NC}"
+        echo "Install with:  apt install curl jq python3  (or equivalent)"
+        exit 1
+    fi
+}
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+
+log()      { echo -e "${CYAN}[$(date +%H:%M:%S)]${NC} $*"; }
+log_ok()   { echo -e "${GREEN}[$(date +%H:%M:%S)] ✓${NC} $*"; }
+log_warn() { echo -e "${YELLOW}[$(date +%H:%M:%S)] !${NC} $*"; }
+log_err()  { echo -e "${RED}[$(date +%H:%M:%S)] ✗${NC} $*"; }
+log_v()    { [[ "$VERBOSE" == "1" ]] && echo -e "${CYAN}[$(date +%H:%M:%S)]${NC} $*" || true; }
+
+# ── RPC calls ────────────────────────────────────────────────────────────────
+
+rpc_get() {
+    curl -sf --connect-timeout 10 --max-time 30 "${RPC_URL}$1" 2>/dev/null
+}
+
+rpc_post() {
+    curl -sf --connect-timeout 10 --max-time 60 \
+        -H "Content-Type: application/json" \
+        -d "$2" "${RPC_URL}$1" 2>/dev/null
+}
+
+# ── Status ───────────────────────────────────────────────────────────────────
+
+show_status() {
+    log "Fetching status from ${RPC_URL}..."
+    local resp
+    resp=$(rpc_get "/status") || { log_err "Cannot reach RPC"; exit 1; }
+    echo "$resp" | jq .
+}
+
+# ── Python mining engine ────────────────────────────────────────────────────
+# The heavy computation (tensor ops, MML, neural path, proof hash) is done
+# in an embedded Python script for correctness and performance.
+
+MINE_PY=$(cat <<'PYEOF'
+import sys, json, math, struct, hashlib, zlib
+
+def tensor_op(op_name, data, rows, cols):
+    n = len(data)
+    if op_name == "matrix_multiply":
+        dim = int(math.sqrt(n))
+        if dim == 0:
+            return [0.0]
+        size = dim * dim
+        a = data[:size]
+        result = [0.0] * size
+        for i in range(dim):
+            for j in range(dim):
+                s = 0.0
+                for k in range(dim):
+                    ai = a[i * dim + k] if (i * dim + k) < size else 0.0
+                    bj = a[k * dim + j] if (k * dim + j) < size else 0.0
+                    s += ai * bj
+                result[i * dim + j] = s
+        return result
+    elif op_name == "convolution":
+        kernel = [0.25, 0.5, 0.25]
+        klen = len(kernel)
+        if n < klen:
+            return list(data)
+        out_len = n - klen + 1
+        result = []
+        for i in range(out_len):
+            s = sum(data[i + j] * kernel[j] for j in range(klen))
+            result.append(s)
+        return result
+    elif op_name == "relu":
+        return [max(0.0, x) for x in data]
+    elif op_name == "sigmoid":
+        def sig(x):
+            if x < -500: return 0.0
+            if x > 500: return 1.0
+            return 1.0 / (1.0 + math.exp(-x))
+        return [sig(x) for x in data]
+    elif op_name == "tanh":
+        return [math.tanh(x) for x in data]
+    elif op_name == "dot_product":
+        half = n // 2
+        dot = sum(data[i] * data[half + i] for i in range(half))
+        return [dot]
+    elif op_name == "normalize":
+        mag = math.sqrt(sum(x * x for x in data))
+        if mag > 1e-7:
+            return [x / mag for x in data]
+        return list(data)
+    else:
+        return [max(0.0, x) for x in data]
+
+def compressed_length(data_bytes):
+    return len(zlib.compress(data_bytes, 6))
+
+def float_list_to_bytes(floats):
+    return b''.join(struct.pack('<f', f) for f in floats)
+
+def compute_mml_score(input_floats, output_floats):
+    in_bytes = float_list_to_bytes(input_floats)
+    out_bytes = float_list_to_bytes(output_floats)
+    in_comp = compressed_length(in_bytes)
+    out_comp = compressed_length(out_bytes)
+    if in_comp == 0:
+        return 1.0
+    return out_comp / in_comp
+
+def expected_path_signature(challenge_id_hex, layer_widths):
+    try:
+        hash_bytes = bytes.fromhex(challenge_id_hex)
+    except:
+        hash_bytes = b'\x00' * 32
+    seed = hashlib.sha256(hash_bytes).digest()
+    sig = []
+    for width in layer_widths:
+        for i in range(width):
+            byte_idx = i % len(seed)
+            bit = (seed[byte_idx] >> (i % 8)) & 1
+            sig.append(bit)
+        seed = hashlib.sha256(seed).digest()
+    return sig
+
+def compute_actual_path(output_floats, nonce, layer_widths):
+    activations = list(output_floats)
+    for i in range(len(activations)):
+        nc = math.sin((nonce + i) * 1e-6) * 0.1
+        activations[i] += nc
+    path_bits = []
+    for width in layer_widths:
+        stride = max(len(activations) // width, 1)
+        layer_out = []
+        for j in range(width):
+            start = j * stride
+            end = min(start + stride, len(activations))
+            s = sum(activations[start:end])
+            val = max(s, 0.0)
+            layer_out.append(val)
+            path_bits.append(1 if val > 0.0 else 0)
+        activations = layer_out
+    return path_bits
+
+def hamming_distance(a, b):
+    min_len = min(len(a), len(b))
+    return sum(1 for i in range(min_len) if a[i] != b[i])
+
+def path_to_hex(path):
+    byte_list = []
+    for i in range(0, len(path), 8):
+        chunk = path[i:i+8]
+        byte_val = 0
+        for bi, bit in enumerate(chunk):
+            if bit:
+                byte_val |= (1 << bi)
+        byte_list.append(byte_val)
+    return bytes(byte_list).hex()
+
+def compute_tensor_hash(floats, shape_dims):
+    h = hashlib.sha256()
+    h.update(float_list_to_bytes(floats))
+    for d in shape_dims:
+        h.update(struct.pack('<Q', d))
+    return h.hexdigest()
+
+def compute_proof_hash(challenge_id, tensor_hash, mml_score, path_sig, nonce):
+    h = hashlib.sha256()
+    h.update(challenge_id.encode())
+    h.update(tensor_hash.encode())
+    h.update(struct.pack('<d', mml_score))
+    h.update(path_sig.encode())
+    h.update(struct.pack('<Q', nonce))
+    return h.hexdigest()
+
+def mine(challenge_json, miner_pubkey, max_iterations, max_dim):
+    c = json.loads(challenge_json)
+    challenge_id = c["id"]
+    slot_hash = c.get("slot_hash", "")
+    op_name = c.get("operation_type", "relu")
+    mml_threshold = c.get("mml_threshold", 0.85)
+    path_distance_max = c.get("path_distance_max", 8)
+    tensor_dim = min(c.get("max_tensor_dim", 64), max_dim)
+
+    shape = c.get("input_tensor", {}).get("shape", {}).get("dims", [tensor_dim, tensor_dim])
+    rows = min(shape[0], max_dim) if len(shape) > 0 else tensor_dim
+    cols = min(shape[1], max_dim) if len(shape) > 1 else rows
+    total = rows * cols
+
+    f32_data = c.get("input_tensor", {}).get("data", {})
+    if isinstance(f32_data, dict):
+        f32_data = f32_data.get("F32", [])
+    input_data = [float(x) for x in f32_data[:total]]
+    while len(input_data) < total:
+        seed = len(input_data) * 0.61803399
+        input_data.append(seed - math.floor(seed))
+
+    output_data = tensor_op(op_name, input_data, rows, cols)
+    out_rows = rows
+    out_cols = cols
+    if op_name == "convolution":
+        out_rows = 1
+        out_cols = len(output_data)
+    elif op_name == "dot_product":
+        out_rows = 1
+        out_cols = 1
+
+    mml_score = compute_mml_score(input_data, output_data)
+    result = {"status": "no_proof", "mml_score": mml_score, "mml_threshold": mml_threshold}
+
+    if mml_score > mml_threshold:
+        result["reason"] = "mml_threshold_not_met"
+        print(json.dumps(result))
+        return
+
+    layer_widths = [32, 16, 8]
+    exp_path = expected_path_signature(challenge_id, layer_widths)
+    tensor_hash = compute_tensor_hash(output_data, [out_rows, out_cols])
+
+    best_dist = 999
+    for nonce in range(max_iterations):
+        actual = compute_actual_path(output_data, nonce, layer_widths)
+        dist = hamming_distance(actual, exp_path)
+        if dist < best_dist:
+            best_dist = dist
+
+        if dist <= path_distance_max:
+            path_sig = path_to_hex(actual)
+            comp_hash = compute_proof_hash(
+                challenge_id, tensor_hash, mml_score, path_sig, nonce
+            )
+            from datetime import datetime, timezone
+            proof = {
+                "status": "proof_found",
+                "proof": {
+                    "challenge_id": challenge_id,
+                    "challenge_hash": slot_hash,
+                    "tensor_result_hash": tensor_hash,
+                    "mml_score": mml_score,
+                    "path_signature": path_sig,
+                    "path_distance": dist,
+                    "computation_nonce": nonce,
+                    "computation_hash": comp_hash,
+                    "miner_pubkey": miner_pubkey,
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }
+            }
+            print(json.dumps(proof))
+            return
+
+        if nonce % 2000 == 0 and nonce > 0:
+            sys.stderr.write(f"  nonce={nonce} best_dist={best_dist}\n")
+
+    result["best_distance"] = best_dist
+    result["path_distance_max"] = path_distance_max
+    result["reason"] = "max_iterations_reached"
+    print(json.dumps(result))
+
+if __name__ == "__main__":
+    challenge_json = sys.argv[1]
+    miner_pubkey = sys.argv[2]
+    max_iter = int(sys.argv[3])
+    max_dim = int(sys.argv[4])
+    mine(challenge_json, miner_pubkey, max_iter, max_dim)
+PYEOF
+)
+
+# ── Mining cycle ─────────────────────────────────────────────────────────────
+
+mine_cycle() {
+    # 1. Fetch challenge
+    log "Fetching challenge..."
+    local challenge
+    challenge=$(rpc_post "/challenge" "{\"device_type\":\"${DEVICE_TYPE}\"}") || {
+        log_err "Failed to fetch challenge"
+        return 1
+    }
+    STAT_CHALLENGES=$((STAT_CHALLENGES + 1))
+
+    local challenge_id op difficulty mml_thresh dim
+    challenge_id=$(echo "$challenge" | jq -r '.id // "unknown"')
+    op=$(echo "$challenge" | jq -r '.operation_type // "relu"')
+    difficulty=$(echo "$challenge" | jq -r '.difficulty // 2')
+    mml_thresh=$(echo "$challenge" | jq -r '.mml_threshold // 0.85')
+    dim=$(echo "$challenge" | jq -r '.max_tensor_dim // 64')
+
+    log "Challenge: ${BOLD}${challenge_id:0:16}...${NC}  op=${BOLD}${op}${NC}  difficulty=${difficulty}  dim=${dim}"
+    log_v "MML threshold: ${mml_thresh}"
+
+    # 2. Mine (call Python engine)
+    log "Mining (max ${MAX_ITERATIONS} iterations)..."
+    local mine_result
+    local tmpfile
+    tmpfile=$(mktemp)
+    echo "$challenge" > "$tmpfile"
+    mine_result=$(python3 -c "$MINE_PY" "$(cat "$tmpfile")" "$MINER_PUBKEY" "$MAX_ITERATIONS" "$MAX_TENSOR_DIM" 2>&1) || {
+        log_err "Mining engine error"
+        rm -f "$tmpfile"
+        return 1
+    }
+    rm -f "$tmpfile"
+
+    # Extract the last JSON line (stderr messages may precede it)
+    local json_line
+    json_line=$(echo "$mine_result" | grep '^{' | tail -1)
+
+    local status
+    status=$(echo "$json_line" | jq -r '.status // "error"')
+
+    if [[ "$status" == "proof_found" ]]; then
+        STAT_PROOFS_FOUND=$((STAT_PROOFS_FOUND + 1))
+        local nonce dist mml
+        nonce=$(echo "$json_line" | jq -r '.proof.computation_nonce')
+        dist=$(echo "$json_line" | jq -r '.proof.path_distance')
+        mml=$(echo "$json_line" | jq -r '.proof.mml_score')
+        log_ok "Proof found!  nonce=${nonce}  path_distance=${dist}  mml_score=${mml}"
+
+        # 3. Submit
+        log "Submitting proof..."
+        local proof_json submit_body submit_resp
+        proof_json=$(echo "$json_line" | jq -c '.proof')
+        submit_body=$(jq -n --argjson proof "$proof_json" '{"proof": $proof}')
+        submit_resp=$(rpc_post "/submit" "$submit_body") || {
+            log_err "Submission request failed"
+            STAT_PROOFS_SUBMITTED=$((STAT_PROOFS_SUBMITTED + 1))
+            return 1
+        }
+        STAT_PROOFS_SUBMITTED=$((STAT_PROOFS_SUBMITTED + 1))
+
+        local accepted tx_sig
+        accepted=$(echo "$submit_resp" | jq -r '.accepted // false')
+        tx_sig=$(echo "$submit_resp" | jq -r '.tx_signature // "n/a"')
+
+        if [[ "$accepted" == "true" ]]; then
+            STAT_PROOFS_ACCEPTED=$((STAT_PROOFS_ACCEPTED + 1))
+            log_ok "${GREEN}${BOLD}ACCEPTED${NC}  tx: ${tx_sig}"
+        else
+            local err_msg
+            err_msg=$(echo "$submit_resp" | jq -r '.error // "unknown"')
+            log_warn "Rejected: ${err_msg}"
+        fi
+    else
+        local reason best_dist
+        reason=$(echo "$json_line" | jq -r '.reason // "unknown"')
+        best_dist=$(echo "$json_line" | jq -r '.best_distance // "?"')
+        local mml_score
+        mml_score=$(echo "$json_line" | jq -r '.mml_score // "?"')
+        log_warn "No proof found (${reason})  mml=${mml_score}  best_dist=${best_dist}"
+    fi
+}
+
+print_stats() {
+    local now elapsed
+    now=$(date +%s)
+    elapsed=$((now - START_TIME))
+    local hrs=$((elapsed / 3600))
+    local mins=$(( (elapsed % 3600) / 60))
+    local secs=$((elapsed % 60))
+    echo -e "\n${BOLD}── Mining Stats ──${NC}"
+    printf "  Uptime:           %02d:%02d:%02d\n" "$hrs" "$mins" "$secs"
+    printf "  Challenges:       %d\n" "$STAT_CHALLENGES"
+    printf "  Proofs found:     %d\n" "$STAT_PROOFS_FOUND"
+    printf "  Proofs submitted: %d\n" "$STAT_PROOFS_SUBMITTED"
+    printf "  Proofs accepted:  %d\n" "$STAT_PROOFS_ACCEPTED"
+    if [[ $STAT_CHALLENGES -gt 0 ]]; then
+        local rate
+        rate=$(python3 -c "print(f'{${STAT_PROOFS_FOUND}/${STAT_CHALLENGES}*100:.1f}')" 2>/dev/null || echo "?")
+        printf "  Success rate:     %s%%\n" "$rate"
+    fi
+    echo ""
+}
+
+# ── Signal handling ──────────────────────────────────────────────────────────
+
+cleanup() {
+    echo ""
+    log "Shutting down..."
+    print_stats
+    exit 0
+}
+trap cleanup SIGINT SIGTERM
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+main() {
+    check_deps
+
+    if [[ "$STATUS_ONLY" == "1" ]]; then
+        show_status
+        exit 0
+    fi
+
+    echo -e "${BOLD}"
+    cat <<'BANNER'
+              _              _
+ _ __   ___ | |_       ___ | |   _ __ ___  _ __   ___
+| '_ \ / _ \| __|____ / _ \| |  | '_ ` _ \| '_ \ / _ \
+| |_) | (_) | ||_____| (_) |_|  | | | | | | | | |  __/
+| .__/ \___/ \__|     \___/(_)  |_| |_| |_|_| |_|\___|
+|_|                   Tribewarez PoT-O Desktop Miner
+BANNER
+    echo -e "${NC}"
+
+    log "RPC:         ${BOLD}${RPC_URL}${NC}"
+    log "Miner:       ${BOLD}${MINER_PUBKEY}${NC}"
+    log "Iterations:  ${MAX_ITERATIONS}"
+    log "Max dim:     ${MAX_TENSOR_DIM}"
+    echo ""
+
+    # Health check
+    local health
+    health=$(rpc_get "/health") || {
+        log_err "Cannot reach RPC at ${RPC_URL}"
+        log_err "Check your connection or set POT_RPC_URL"
+        exit 1
+    }
+    log_ok "RPC healthy: $(echo "$health" | jq -r '.service // "unknown"') v$(echo "$health" | jq -r '.version // "?"')"
+    echo ""
+
+    if [[ "$ONCE" == "1" ]]; then
+        mine_cycle
+        print_stats
+        exit 0
+    fi
+
+    while true; do
+        mine_cycle || true
+        print_stats
+        log "Next cycle in ${LOOP_DELAY}s... (Ctrl+C to stop)"
+        sleep "$LOOP_DELAY"
+    done
+}
+
+main "$@"
