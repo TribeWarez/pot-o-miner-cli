@@ -14,12 +14,13 @@ VERSION="1.0.0"
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
 RPC_URL="${POT_RPC_URL:-https://pot.rpc.gateway.tribewarez.com}"
+STATUS_URL="${POT_STATUS_URL:-https://status.rpc.gateway.tribewarez.com}"
 MINER_PUBKEY="${POT_MINER_PUBKEY:-$(hostname)-$(whoami)-$(date +%s)}"
 MAX_ITERATIONS="${POT_MAX_ITERATIONS:-10000}"
 MAX_TENSOR_DIM="${POT_MAX_TENSOR_DIM:-256}"
 LOOP_DELAY="${POT_LOOP_DELAY:-2}"
-DEVICE_TYPE="native"
-VERBOSE="${POT_VERBOSE:-0}"
+DEVICE_TYPE="cpu"
+VERBOSE="${POT_VERBOSE:-10}"
 
 # Stats
 STAT_CHALLENGES=0
@@ -51,8 +52,19 @@ ${BOLD}OPTIONS:${NC}
     -i, --iterations N     Max nonce iterations per challenge (default: 10000)
     -d, --dim N            Max tensor dimension (default: 256)
     -D, --delay SECS       Delay between mining cycles (default: 2)
+    -o, --op TYPE          Prefer tensor op: matrix_multiply, convolution, relu, sigmoid, tanh, dot_product, normalize
+    --path-layers W,W,W    Neural path layer widths (default: 32,16,8)
+    --mml-threshold R      Override MML threshold (decimal, challenge value used if not set)
+    --explain              Print how MML/path calculation is done (step-by-step)
     -1, --once             Mine a single challenge then exit
     -s, --status           Print RPC status and exit
+    --dashboard            Run live stats dashboard (TUI)
+    --pool                 Print pool info and exit
+    --peers                Print network peers and exit
+    --devices              Print registered devices and exit
+    --miner-info KEY       Print miner account for pubkey and exit
+    --register-device JSON Register an ESP/external device (JSON body)
+    --service-status ID    Print Status API single service (e.g. solana-rpc-proxy, pot-o-validator)
     -v, --verbose          Verbose output
     -h, --help             Show this help
 
@@ -62,6 +74,11 @@ ${BOLD}ENVIRONMENT:${NC}
     POT_MAX_ITERATIONS     Max iterations
     POT_MAX_TENSOR_DIM     Max tensor dimension
     POT_LOOP_DELAY         Cycle delay
+    POT_OPERATION          Prefer tensor op (same as --op)
+    POT_PATH_LAYERS        Comma-sep layer widths (e.g. 32,16,8)
+    POT_MML_THRESHOLD      Override MML threshold
+    POT_EXPLAIN            Set to 1 to show calculation steps
+    POT_STATUS_URL         Status API base (for --service-status, --dashboard)
     POT_VERBOSE            Verbose mode (1/0)
 
 ${BOLD}EXAMPLES:${NC}
@@ -69,6 +86,7 @@ ${BOLD}EXAMPLES:${NC}
     pot-o-mine --rpc http://localhost:8900 --once  # Single challenge on local RPC
     pot-o-mine --status                           # Show validator status
     pot-o-mine -k my_wallet_pubkey -i 50000       # Mine with custom key & iterations
+    pot-o-mine --service-status solana-rpc-proxy   # Single service from Status API
 EOF
     exit 0
 }
@@ -77,21 +95,48 @@ EOF
 
 ONCE=0
 STATUS_ONLY=0
+DASHBOARD=0
+POOL_ONLY=0
+PEERS_ONLY=0
+DEVICES_ONLY=0
+MINER_INFO_KEY=""
+REGISTER_DEVICE_JSON=""
+SERVICE_STATUS_ID=""
+POT_OP="${POT_OPERATION:-}"
+POT_PATH_LAYERS="${POT_PATH_LAYERS:-32,16,8}"
+POT_MML_THRESHOLD="${POT_MML_THRESHOLD:-}"
+POT_EXPLAIN="${POT_EXPLAIN:-0}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -r|--rpc)       RPC_URL="$2"; shift 2 ;;
-        -k|--pubkey)    MINER_PUBKEY="$2"; shift 2 ;;
-        -i|--iterations) MAX_ITERATIONS="$2"; shift 2 ;;
-        -d|--dim)       MAX_TENSOR_DIM="$2"; shift 2 ;;
-        -D|--delay)     LOOP_DELAY="$2"; shift 2 ;;
-        -1|--once)      ONCE=1; shift ;;
-        -s|--status)    STATUS_ONLY=1; shift ;;
-        -v|--verbose)   VERBOSE=1; shift ;;
-        -h|--help)      usage ;;
-        *)              echo "Unknown option: $1"; usage ;;
+        -r|--rpc)             RPC_URL="${2:-}"; shift 2 ;;
+        -k|--pubkey)          MINER_PUBKEY="${2:-}"; shift 2 ;;
+        -i|--iterations)      MAX_ITERATIONS="${2:-}"; shift 2 ;;
+        -d|--dim)             MAX_TENSOR_DIM="${2:-}"; shift 2 ;;
+        -D|--delay)           LOOP_DELAY="${2:-}"; shift 2 ;;
+        -o|--op)              POT_OP="${2:-}"; shift 2 ;;
+        --path-layers)        POT_PATH_LAYERS="${2:-}"; shift 2 ;;
+        --mml-threshold)      POT_MML_THRESHOLD="${2:-}"; shift 2 ;;
+        --explain)            POT_EXPLAIN=1; shift ;;
+        -1|--once)            ONCE=1; shift ;;
+        -s|--status)          STATUS_ONLY=1; shift ;;
+        --dashboard)          DASHBOARD=1; shift ;;
+        --pool)               POOL_ONLY=1; shift ;;
+        --peers)              PEERS_ONLY=1; shift ;;
+        --devices)            DEVICES_ONLY=1; shift ;;
+        --miner-info)         MINER_INFO_KEY="${2:-}"; shift 2 ;;
+        --register-device)    REGISTER_DEVICE_JSON="${2:-}"; shift 2 ;;
+        --service-status)     SERVICE_STATUS_ID="${2:-}"; shift 2 ;;
+        -v|--verbose)         VERBOSE=1; shift ;;
+        -h|--help)            usage ;;
+        *)                    echo "Unknown option: $1"; usage ;;
     esac
 done
+
+# Re-apply default miner identity if -k/--pubkey was given but empty (e.g. failed solana-keygen pubkey)
+if [[ -z "${MINER_PUBKEY:-}" ]]; then
+    MINER_PUBKEY="${POT_MINER_PUBKEY:-$(hostname)-$(whoami)-$(date +%s)}"
+fi
 
 # ── Dependency check ─────────────────────────────────────────────────────────
 
@@ -129,12 +174,92 @@ rpc_post() {
         -d "$2" "${RPC_URL}$1" 2>/dev/null
 }
 
-# ── Status ───────────────────────────────────────────────────────────────────
+# GET /pool – pool info (type, miners, stake, minimum_stake)
+rpc_pool() {
+    rpc_get "/pool"
+}
+
+# GET /miners/:pubkey – miner account (proxied from on-chain)
+rpc_miner() {
+    local pubkey="$1"
+    rpc_get "/miners/${pubkey}"
+}
+
+# GET /network/peers – list known peers
+rpc_peers() {
+    rpc_get "/network/peers"
+}
+
+# GET /devices – registered devices (ESP, etc.)
+rpc_devices() {
+    rpc_get "/devices"
+}
+
+# POST /devices/register – register ESP or external mining device
+rpc_register_device() {
+    local body="$1"
+    rpc_post "/devices/register" "$body"
+}
+
+# Status API (status.rpc.gateway.tribewarez.com): GET /service/:id
+status_api_get() {
+    curl -sf --connect-timeout 10 --max-time 30 "${STATUS_URL}$1" 2>/dev/null
+}
+
+# ── Status & API info ─────────────────────────────────────────────────────────
 
 show_status() {
     log "Fetching status from ${RPC_URL}..."
     local resp
     resp=$(rpc_get "/status") || { log_err "Cannot reach RPC"; exit 1; }
+    echo "$resp" | jq .
+}
+
+show_pool() {
+    log "Fetching pool from ${RPC_URL}..."
+    local resp
+    resp=$(rpc_pool) || { log_err "Cannot reach RPC"; exit 1; }
+    echo "$resp" | jq .
+}
+
+show_peers() {
+    log "Fetching network peers from ${RPC_URL}..."
+    local resp
+    resp=$(rpc_peers) || { log_err "Cannot reach RPC"; exit 1; }
+    echo "$resp" | jq .
+}
+
+show_devices() {
+    log "Fetching devices from ${RPC_URL}..."
+    local resp
+    resp=$(rpc_devices) || { log_err "Cannot reach RPC"; exit 1; }
+    echo "$resp" | jq .
+}
+
+show_miner_info() {
+    local key="$1"
+    [[ -z "$key" ]] && { log_err "Missing pubkey for --miner-info"; exit 1; }
+    log "Fetching miner ${key} from ${RPC_URL}..."
+    local resp
+    resp=$(rpc_miner "$key") || { log_err "Cannot reach RPC"; exit 1; }
+    echo "$resp" | jq .
+}
+
+do_register_device() {
+    local body="$1"
+    [[ -z "$body" ]] && { log_err "Missing JSON body for --register-device"; exit 1; }
+    log "Registering device..."
+    local resp
+    resp=$(rpc_register_device "$body") || { log_err "Device registration failed"; exit 1; }
+    echo "$resp" | jq .
+}
+
+show_service_status() {
+    local id="$1"
+    [[ -z "$id" ]] && { log_err "Missing service id for --service-status"; exit 1; }
+    log "Fetching service ${id} from ${STATUS_URL}..."
+    local resp
+    resp=$(status_api_get "/service/${id}") || { log_err "Cannot reach Status API"; exit 1; }
     echo "$resp" | jq .
 }
 
@@ -276,19 +401,36 @@ def compute_proof_hash(challenge_id, tensor_hash, mml_score, path_sig, nonce):
     h.update(struct.pack('<Q', nonce))
     return h.hexdigest()
 
-def mine(challenge_json, miner_pubkey, max_iterations, max_dim):
+def _log_explain(show, msg):
+    if show:
+        sys.stderr.write("[explain] " + msg + "\n")
+        sys.stderr.flush()
+
+def mine(challenge_json, miner_pubkey, max_iterations, max_dim, op_override="", path_layers_str="32,16,8", mml_override_str="", show_calculation=False):
     c = json.loads(challenge_json)
     challenge_id = c["id"]
     slot_hash = c.get("slot_hash", "")
-    op_name = c.get("operation_type", "relu")
-    mml_threshold = c.get("mml_threshold", 0.85)
+    op_name = (op_override.strip() or c.get("operation_type", "relu")).strip() or "relu"
+    mml_threshold = float(mml_override_str) if (mml_override_str and mml_override_str.strip()) else float(c.get("mml_threshold", 0.85))
     path_distance_max = c.get("path_distance_max", 8)
     tensor_dim = min(c.get("max_tensor_dim", 64), max_dim)
+
+    # Parse path layer widths (e.g. "32,16,8" -> [32, 16, 8])
+    layer_widths = [32, 16, 8]
+    if path_layers_str and path_layers_str.strip():
+        try:
+            layer_widths = [int(x.strip()) for x in path_layers_str.split(",") if x.strip()]
+            if not layer_widths:
+                layer_widths = [32, 16, 8]
+        except (ValueError, TypeError):
+            pass
 
     shape = c.get("input_tensor", {}).get("shape", {}).get("dims", [tensor_dim, tensor_dim])
     rows = min(shape[0], max_dim) if len(shape) > 0 else tensor_dim
     cols = min(shape[1], max_dim) if len(shape) > 1 else rows
     total = rows * cols
+
+    _log_explain(show_calculation, "Challenge id=%s op=%s mml_threshold=%s path_distance_max=%s tensor shape=(%s,%s) path_layers=%s" % (challenge_id[:16], op_name, mml_threshold, path_distance_max, rows, cols, layer_widths))
 
     f32_data = c.get("input_tensor", {}).get("data", {})
     if isinstance(f32_data, dict):
@@ -297,6 +439,8 @@ def mine(challenge_json, miner_pubkey, max_iterations, max_dim):
     while len(input_data) < total:
         seed = len(input_data) * 0.61803399
         input_data.append(seed - math.floor(seed))
+
+    _log_explain(show_calculation, "Input tensor: %d floats (rows=%d cols=%d). Apply op: %s" % (len(input_data), rows, cols, op_name))
 
     output_data = tensor_op(op_name, input_data, rows, cols)
     out_rows = rows
@@ -308,7 +452,15 @@ def mine(challenge_json, miner_pubkey, max_iterations, max_dim):
         out_rows = 1
         out_cols = 1
 
+    _log_explain(show_calculation, "Output tensor: %d floats (shape %dx%d)" % (len(output_data), out_rows, out_cols))
+
     mml_score = compute_mml_score(input_data, output_data)
+    in_bytes = float_list_to_bytes(input_data)
+    out_bytes = float_list_to_bytes(output_data)
+    in_comp = compressed_length(in_bytes)
+    out_comp = compressed_length(out_bytes)
+    _log_explain(show_calculation, "MML score = compressed(output)/compressed(input) = %d/%d = %.6f (must be <= %.4f)" % (out_comp, in_comp, mml_score, mml_threshold))
+
     result = {"status": "no_proof", "mml_score": mml_score, "mml_threshold": mml_threshold}
 
     if mml_score > mml_threshold:
@@ -316,8 +468,8 @@ def mine(challenge_json, miner_pubkey, max_iterations, max_dim):
         print(json.dumps(result))
         return
 
-    layer_widths = [32, 16, 8]
     exp_path = expected_path_signature(challenge_id, layer_widths)
+    _log_explain(show_calculation, "Expected path (from challenge_id hash): %d bits. Searching nonce 0..%d for path Hamming distance <= %d" % (len(exp_path), max_iterations - 1, path_distance_max))
     tensor_hash = compute_tensor_hash(output_data, [out_rows, out_cols])
 
     best_dist = 999
@@ -364,17 +516,28 @@ if __name__ == "__main__":
     miner_pubkey = sys.argv[2]
     max_iter = int(sys.argv[3])
     max_dim = int(sys.argv[4])
-    mine(challenge_json, miner_pubkey, max_iter, max_dim)
+    op_override = sys.argv[5] if len(sys.argv) > 5 else ""
+    path_layers_str = sys.argv[6] if len(sys.argv) > 6 else "32,16,8"
+    mml_override_str = sys.argv[7] if len(sys.argv) > 7 else ""
+    show_calculation = (sys.argv[8] == "1") if len(sys.argv) > 8 else False
+    mine(challenge_json, miner_pubkey, max_iter, max_dim, op_override, path_layers_str, mml_override_str, show_calculation)
 PYEOF
 )
 
 # ── Mining cycle ─────────────────────────────────────────────────────────────
 
 mine_cycle() {
-    # 1. Fetch challenge
+    # 1. Fetch challenge (API: slot, slot_hash, device_type)
     log "Fetching challenge..."
+    local challenge_body
+    if [[ -n "${POT_SLOT:-}" && -n "${POT_SLOT_HASH:-}" ]]; then
+        challenge_body=$(jq -n --arg slot "$POT_SLOT" --arg slot_hash "$POT_SLOT_HASH" --arg device_type "$DEVICE_TYPE" \
+            '{slot: ($slot | tonumber?), slot_hash: $slot_hash, device_type: $device_type}')
+    else
+        challenge_body=$(jq -n --arg device_type "$DEVICE_TYPE" '{device_type: $device_type}')
+    fi
     local challenge
-    challenge=$(rpc_post "/challenge" "{\"device_type\":\"${DEVICE_TYPE}\"}") || {
+    challenge=$(rpc_post "/challenge" "$challenge_body") || {
         log_err "Failed to fetch challenge"
         return 1
     }
@@ -390,18 +553,24 @@ mine_cycle() {
     log "Challenge: ${BOLD}${challenge_id:0:16}...${NC}  op=${BOLD}${op}${NC}  difficulty=${difficulty}  dim=${dim}"
     log_v "MML threshold: ${mml_thresh}"
 
-    # 2. Mine (call Python engine)
+    # 2. Mine (call Python engine; optional: op, path-layers, mml-threshold, explain)
     log "Mining (max ${MAX_ITERATIONS} iterations)..."
     local mine_result
     local tmpfile
     tmpfile=$(mktemp)
     echo "$challenge" > "$tmpfile"
-    mine_result=$(python3 -c "$MINE_PY" "$(cat "$tmpfile")" "$MINER_PUBKEY" "$MAX_ITERATIONS" "$MAX_TENSOR_DIM" 2>&1) || {
+    mine_result=$(python3 -c "$MINE_PY" "$(cat "$tmpfile")" "$MINER_PUBKEY" "$MAX_ITERATIONS" "$MAX_TENSOR_DIM" \
+        "${POT_OP:-}" "${POT_PATH_LAYERS:-32,16,8}" "${POT_MML_THRESHOLD:-}" "${POT_EXPLAIN:-0}" 2>&1) || {
         log_err "Mining engine error"
         rm -f "$tmpfile"
         return 1
     }
     rm -f "$tmpfile"
+
+    # When --explain: print calculation steps (from Python stderr)
+    if [[ "${POT_EXPLAIN:-0}" == "1" ]]; then
+        echo "$mine_result" | grep '^\[explain\]' || true
+    fi
 
     # Extract the last JSON line (stderr messages may precede it)
     local json_line
@@ -418,11 +587,26 @@ mine_cycle() {
         mml=$(echo "$json_line" | jq -r '.proof.mml_score')
         log_ok "Proof found!  nonce=${nonce}  path_distance=${dist}  mml_score=${mml}"
 
-        # 3. Submit
+        # 3. Submit (API: proof + optional signature; never use a keypair file as signature)
         log "Submitting proof..."
-        local proof_json submit_body submit_resp
+        local proof_json submit_body submit_resp sig_json
         proof_json=$(echo "$json_line" | jq -c '.proof')
-        submit_body=$(jq -n --argjson proof "$proof_json" '{"proof": $proof}')
+        if [[ -n "${POT_SUBMIT_SIGNATURE:-}" ]]; then
+            sig_json="$POT_SUBMIT_SIGNATURE"
+        elif [[ -f "${POT_MINER_JSON:-}" ]]; then
+            sig_json=$(jq -c '.' "${POT_MINER_JSON}" 2>/dev/null || true)
+        elif [[ -f "$(dirname "$0")/miner.json" ]]; then
+            sig_json=$(jq -c '.' "$(dirname "$0")/miner.json" 2>/dev/null || true)
+        elif [[ -f "miner.json" ]]; then
+            sig_json=$(jq -c '.' "miner.json" 2>/dev/null || true)
+        fi
+        # Safety: Solana keypair (solana-keygen new -o miner.json) is 64 bytes — do NOT send as signature
+        if [[ -n "$sig_json" && "$(echo "$sig_json" | jq 'length')" == "64" ]]; then
+            log_warn "miner.json looks like a Solana keypair (64 bytes); not sending as signature (use -k \$(solana-keygen pubkey miner.json) for identity)"
+            sig_json="[]"
+        fi
+        sig_json="${sig_json:-[]}"
+        submit_body=$(jq -n --argjson proof "$proof_json" --argjson signature "$sig_json" '{"proof": $proof, "signature": $signature}')
         submit_resp=$(rpc_post "/submit" "$submit_body") || {
             log_err "Submission request failed"
             STAT_PROOFS_SUBMITTED=$((STAT_PROOFS_SUBMITTED + 1))
@@ -491,6 +675,36 @@ main() {
     if [[ "$STATUS_ONLY" == "1" ]]; then
         show_status
         exit 0
+    fi
+    if [[ "$POOL_ONLY" == "1" ]]; then
+        show_pool
+        exit 0
+    fi
+    if [[ "$PEERS_ONLY" == "1" ]]; then
+        show_peers
+        exit 0
+    fi
+    if [[ "$DEVICES_ONLY" == "1" ]]; then
+        show_devices
+        exit 0
+    fi
+    if [[ -n "$MINER_INFO_KEY" ]]; then
+        show_miner_info "$MINER_INFO_KEY"
+        exit 0
+    fi
+    if [[ -n "$REGISTER_DEVICE_JSON" ]]; then
+        do_register_device "$REGISTER_DEVICE_JSON"
+        exit 0
+    fi
+    if [[ -n "$SERVICE_STATUS_ID" ]]; then
+        show_service_status "$SERVICE_STATUS_ID"
+        exit 0
+    fi
+    if [[ "$DASHBOARD" == "1" ]]; then
+        export POT_RPC_URL="$RPC_URL" POT_MINER_PUBKEY="$MINER_PUBKEY"
+        export POT_STATUS_URL="$STATUS_URL"
+        BINDIR="$(cd "$(dirname "$0")" && pwd)"
+        exec python3 "${BINDIR}/pot-o-mine-dashboard.py"
     fi
 
     echo -e "${BOLD}"
