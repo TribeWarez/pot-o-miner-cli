@@ -1,6 +1,12 @@
 # pot-o-mine – PoT-O Desktop Miner CLI
 
+[![CI](https://img.shields.io/github/actions/workflow/status/TribeWarez/pot-o-miner-cli/ci.yml?branch=main)](https://github.com/TribeWarez/pot-o-miner-cli/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A self-contained bash CLI that mines PoT-O (Proof of Tensor Optimizations) challenges on local PC hardware. Connects to the Tribewarez PoT-O RPC validator, fetches tensor challenges, performs all mining computation locally (tensor ops, MML compression, neural path matching), and submits proofs for on-chain verification and rewards.
+
+- **Repository:** [github.com/TribeWarez/pot-o-miner-cli](https://github.com/TribeWarez/pot-o-miner-cli)
+- **PoT-O RPC:** [pot.rpc.gateway.tribewarez.com](https://pot.rpc.gateway.tribewarez.com)
 
 ## Requirements
 
@@ -49,7 +55,7 @@ Then run the miner as usual. The miner CLI talks to the PoT-O validator (`POT_RP
 
 ```bash
 # Clone and run
-git clone <this-repo-url> pot-o-miner-cli
+git clone https://github.com/TribeWarez/pot-o-miner-cli.git pot-o-miner-cli
 cd pot-o-miner-cli
 chmod +x pot-o-mine
 ./pot-o-mine
@@ -288,4 +294,4 @@ The mining computation (tensor ops, compression, neural path, SHA-256 hashing) r
 
 ## License
 
-Part of the Tribewarez testnet RPC infrastructure.
+[MIT](LICENSE)
