@@ -32,6 +32,19 @@ solana config set --url https://testnet-solana.rpc.gateway.tribewarez.com
 solana airdrop 10
 ```
 
+### Mining with Helius (mainnet Solana RPC)
+
+To use **Helius** as your Solana RPC (e.g. for `solana` CLI or for a validator that uses Solana mainnet), set the URL in the environment and **do not commit your API key**:
+
+```bash
+# Use your own API key; never commit it to the repo
+export POT_SOLANA_RPC_URL="https://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY"
+# Optional: use same URL for solana CLI
+solana config set --url "$POT_SOLANA_RPC_URL"
+```
+
+Then run the miner as usual. The miner CLI talks to the PoT-O validator (`POT_RPC_URL`); the validator may use Solana for slot/state. For local `solana` commands (balance, airdrop on devnet/testnet, etc.) use `solana config set --url <rpc>` or `POT_SOLANA_RPC_URL` in your own scripts. You can put `POT_SOLANA_RPC_URL=...` in a `.env` file (the repo ignores `.env`) so you never commit your API key.
+
 ## Quick Start
 
 ```bash
@@ -79,6 +92,11 @@ OPTIONS:
 # Mine against a local validator
 ./pot-o-mine --rpc http://localhost:8900
 
+# Use Helius (or any Solana RPC) for solana CLI; miner still uses POT_RPC_URL for challenges
+export POT_SOLANA_RPC_URL="https://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY"
+solana config set --url "$POT_SOLANA_RPC_URL"
+./pot-o-mine -k $(solana-keygen pubkey mineri.json)
+
 # Mine a single challenge and exit
 ./pot-o-mine --once --verbose
 
@@ -125,6 +143,7 @@ OPTIONS:
 | `POT_MML_THRESHOLD` | Override MML threshold | (challenge default) |
 | `POT_EXPLAIN` | `1` = print calculation steps to stderr | `0` |
 | `POT_STATUS_URL` | Status API base (dashboard, --service-status) | `https://status.rpc.gateway.tribewarez.com` |
+| `POT_SOLANA_RPC_URL` | Optional Solana RPC (e.g. Helius mainnet) for solana CLI / validator; never commit API keys | (none) |
 | `POT_MINER_JSON` | Path to JSON file with submit signature (array of ints) | (none; else `miner.json` in script dir or CWD) |
 | `POT_SUBMIT_SIGNATURE` | Submit signature as JSON array (overrides file) | (none) |
 | `POT_VERBOSE` | Verbose output (1/0) | `0` |

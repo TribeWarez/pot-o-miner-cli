@@ -79,6 +79,7 @@ ${BOLD}ENVIRONMENT:${NC}
     POT_MML_THRESHOLD      Override MML threshold
     POT_EXPLAIN            Set to 1 to show calculation steps
     POT_STATUS_URL         Status API base (for --service-status, --dashboard)
+    POT_SOLANA_RPC_URL     Optional Solana RPC (e.g. Helius mainnet) for solana CLI; never commit API keys
     POT_VERBOSE            Verbose mode (1/0)
 
 ${BOLD}EXAMPLES:${NC}
@@ -104,7 +105,7 @@ REGISTER_DEVICE_JSON=""
 SERVICE_STATUS_ID=""
 POT_OP="${POT_OPERATION:-}"
 POT_PATH_LAYERS="${POT_PATH_LAYERS:-32,16,8}"
-POT_MML_THRESHOLD="${POT_MML_THRESHOLD:-}"
+POT_MML_THRESHOLD="${POT_MML_THRESHOLD:-22}"
 POT_EXPLAIN="${POT_EXPLAIN:-0}"
 
 while [[ $# -gt 0 ]]; do
@@ -137,6 +138,23 @@ done
 if [[ -z "${MINER_PUBKEY:-}" ]]; then
     MINER_PUBKEY="${POT_MINER_PUBKEY:-$(hostname)-$(whoami)-$(date +%s)}"
 fi
+
+# ── Device config (device_id / device_type for registry and progress) ─────────
+# Load from miner.json if it's an object with device_type/device_id; env overrides.
+DEVICE_ID="${POT_DEVICE_ID:-}"
+MINER_JSON_PATH=""
+[[ -f "${POT_MINER_JSON:-}" ]] && MINER_JSON_PATH="${POT_MINER_JSON}"
+[[ -z "$MINER_JSON_PATH" && -f "$(dirname "$0")/miner.json" ]] && MINER_JSON_PATH="$(dirname "$0")/miner.json"
+[[ -z "$MINER_JSON_PATH" && -f "miner.json" ]] && MINER_JSON_PATH="miner.json"
+if [[ -n "$MINER_JSON_PATH" ]]; then
+    if jq -e 'type == "object"' "$MINER_JSON_PATH" &>/dev/null; then
+        [[ -z "$DEVICE_ID" ]] && DEVICE_ID=$(jq -r '.device_id // ""' "$MINER_JSON_PATH")
+        _dt=$(jq -r '.device_type // ""' "$MINER_JSON_PATH")
+        [[ -n "$_dt" ]] && DEVICE_TYPE="$_dt"
+    fi
+fi
+[[ -n "${POT_DEVICE_TYPE:-}" ]] && DEVICE_TYPE="${POT_DEVICE_TYPE}"
+DEVICE_ID="${DEVICE_ID:-}"
 
 # ── Dependency check ─────────────────────────────────────────────────────────
 
@@ -174,6 +192,32 @@ rpc_post() {
         -d "$2" "${RPC_URL}$1" 2>/dev/null
 }
 
+# Check JSON body for ErrorResponse { "ok": false, "error": "..." } or
+# NotFoundResponse { "error": "Not Found", "message": "...", "available": [...] }.
+# Returns 0 if no error, 1 if error (and logs .error / .message).
+check_api_error() {
+    local json="$1"
+    [[ -z "$json" ]] && return 0
+    local ok
+    ok=$(echo "$json" | jq -r '.ok // empty')
+    if [[ "$ok" == "false" ]]; then
+        local err
+        err=$(echo "$json" | jq -r '.error // "unknown"')
+        log_err "API error: $err"
+        return 1
+    fi
+    local nf_err
+    nf_err=$(echo "$json" | jq -r 'if .error == "Not Found" then (.message // .error) else empty end')
+    if [[ -n "$nf_err" ]]; then
+        log_err "Not Found: $nf_err"
+        local avail
+        avail=$(echo "$json" | jq -r '.available[]?' 2>/dev/null | tr '\n' ' ')
+        [[ -n "$avail" ]] && log "Available: $avail"
+        return 1
+    fi
+    return 0
+}
+
 # GET /pool – pool info (type, miners, stake, minimum_stake)
 rpc_pool() {
     rpc_get "/pool"
@@ -201,6 +245,24 @@ rpc_register_device() {
     rpc_post "/devices/register" "$body"
 }
 
+# POST /devices/progress – report current calculation (best-effort; no exit on failure)
+send_progress() {
+    local challenge_id="$1"
+    local hash="$2"
+    local device_id="$3"
+    local device_type="$4"
+    local body
+    if [[ -n "$device_id" ]]; then
+        body=$(jq -n --arg device_id "$device_id" --arg challenge_id "$challenge_id" --arg hash "$hash" \
+            '{device_id: $device_id, challenge_id: $challenge_id, hash: $hash}')
+    else
+        body=$(jq -n --arg miner_pubkey "$MINER_PUBKEY" --arg device_type "$device_type" \
+            --arg challenge_id "$challenge_id" --arg hash "$hash" \
+            '{miner_pubkey: $miner_pubkey, device_type: $device_type, challenge_id: $challenge_id, hash: $hash}')
+    fi
+    rpc_post "/devices/progress" "$body" >/dev/null 2>&1 || true
+}
+
 # Status API (status.rpc.gateway.tribewarez.com): GET /service/:id
 status_api_get() {
     curl -sf --connect-timeout 10 --max-time 30 "${STATUS_URL}$1" 2>/dev/null
@@ -212,6 +274,7 @@ show_status() {
     log "Fetching status from ${RPC_URL}..."
     local resp
     resp=$(rpc_get "/status") || { log_err "Cannot reach RPC"; exit 1; }
+    check_api_error "$resp" || exit 1
     echo "$resp" | jq .
 }
 
@@ -219,6 +282,7 @@ show_pool() {
     log "Fetching pool from ${RPC_URL}..."
     local resp
     resp=$(rpc_pool) || { log_err "Cannot reach RPC"; exit 1; }
+    check_api_error "$resp" || exit 1
     echo "$resp" | jq .
 }
 
@@ -226,14 +290,36 @@ show_peers() {
     log "Fetching network peers from ${RPC_URL}..."
     local resp
     resp=$(rpc_peers) || { log_err "Cannot reach RPC"; exit 1; }
+    check_api_error "$resp" || exit 1
     echo "$resp" | jq .
 }
 
+# MinersResponse: miners_by_device (DeviceTypeStats per type), generated_at
+# DeviceTypeStats: count, proofs_valid, tasks_processed, last_activity
 show_devices() {
     log "Fetching devices from ${RPC_URL}..."
     local resp
     resp=$(rpc_devices) || { log_err "Cannot reach RPC"; exit 1; }
-    echo "$resp" | jq .
+    check_api_error "$resp" || exit 1
+    if echo "$resp" | jq -e '.miners_by_device != null' &>/dev/null; then
+        local gen_at
+        gen_at=$(echo "$resp" | jq -r '.generated_at // "n/a"')
+        echo -e "${BOLD}Miners by device${NC}  (generated_at: ${gen_at})"
+        echo ""
+        for key in $(echo "$resp" | jq -r '.miners_by_device | keys[]?' 2>/dev/null); do
+            local count proofs tasks last_act
+            count=$(echo "$resp" | jq -r --arg k "$key" '.miners_by_device[$k].count // 0')
+            proofs=$(echo "$resp" | jq -r --arg k "$key" '.miners_by_device[$k].proofs_valid // "-"')
+            tasks=$(echo "$resp" | jq -r --arg k "$key" '.miners_by_device[$k].tasks_processed // "-"')
+            last_act=$(echo "$resp" | jq -r --arg k "$key" '.miners_by_device[$k].last_activity // "-"')
+            printf "  %-10s  count=%s  proofs_valid=%s  tasks_processed=%s  last_activity=%s\n" \
+                "$key" "$count" "$proofs" "$tasks" "$last_act"
+        done
+        echo ""
+        echo "$resp" | jq .
+    else
+        echo "$resp" | jq .
+    fi
 }
 
 show_miner_info() {
@@ -242,15 +328,33 @@ show_miner_info() {
     log "Fetching miner ${key} from ${RPC_URL}..."
     local resp
     resp=$(rpc_miner "$key") || { log_err "Cannot reach RPC"; exit 1; }
+    check_api_error "$resp" || exit 1
     echo "$resp" | jq .
 }
 
 do_register_device() {
-    local body="$1"
-    [[ -z "$body" ]] && { log_err "Missing JSON body for --register-device"; exit 1; }
+    local arg="$1"
+    local body
+    if [[ -z "$arg" ]]; then
+        log_err "Missing JSON body or file for --register-device"
+        exit 1
+    fi
+    if [[ -f "$arg" ]]; then
+        body=$(cat "$arg")
+    else
+        body="$arg"
+    fi
+    [[ -z "$body" ]] && { log_err "Empty JSON body for --register-device"; exit 1; }
     log "Registering device..."
     local resp
-    resp=$(rpc_register_device "$body") || { log_err "Device registration failed"; exit 1; }
+    resp=$(rpc_register_device "$body")
+    local rv=$?
+    if [[ $rv -ne 0 ]]; then
+        check_api_error "$resp"   # show API error from body if present
+        log_err "Device registration failed"
+        exit 1
+    fi
+    check_api_error "$resp" || exit 1
     echo "$resp" | jq .
 }
 
@@ -527,20 +631,30 @@ PYEOF
 # ── Mining cycle ─────────────────────────────────────────────────────────────
 
 mine_cycle() {
-    # 1. Fetch challenge (API: slot, slot_hash, device_type)
+    # 1. Fetch challenge (API: slot, slot_hash, device_type, optional device_id)
     log "Fetching challenge..."
     local challenge_body
     if [[ -n "${POT_SLOT:-}" && -n "${POT_SLOT_HASH:-}" ]]; then
-        challenge_body=$(jq -n --arg slot "$POT_SLOT" --arg slot_hash "$POT_SLOT_HASH" --arg device_type "$DEVICE_TYPE" \
-            '{slot: ($slot | tonumber?), slot_hash: $slot_hash, device_type: $device_type}')
+        if [[ -n "$DEVICE_ID" ]]; then
+            challenge_body=$(jq -n --arg slot "$POT_SLOT" --arg slot_hash "$POT_SLOT_HASH" --arg device_type "$DEVICE_TYPE" --arg device_id "$DEVICE_ID" \
+                '{slot: ($slot | tonumber?), slot_hash: $slot_hash, device_type: $device_type, device_id: $device_id}')
+        else
+            challenge_body=$(jq -n --arg slot "$POT_SLOT" --arg slot_hash "$POT_SLOT_HASH" --arg device_type "$DEVICE_TYPE" \
+                '{slot: ($slot | tonumber?), slot_hash: $slot_hash, device_type: $device_type}')
+        fi
     else
-        challenge_body=$(jq -n --arg device_type "$DEVICE_TYPE" '{device_type: $device_type}')
+        if [[ -n "$DEVICE_ID" ]]; then
+            challenge_body=$(jq -n --arg device_type "$DEVICE_TYPE" --arg device_id "$DEVICE_ID" '{device_type: $device_type, device_id: $device_id}')
+        else
+            challenge_body=$(jq -n --arg device_type "$DEVICE_TYPE" '{device_type: $device_type}')
+        fi
     fi
     local challenge
     challenge=$(rpc_post "/challenge" "$challenge_body") || {
         log_err "Failed to fetch challenge"
         return 1
     }
+    check_api_error "$challenge" || return 1
     STAT_CHALLENGES=$((STAT_CHALLENGES + 1))
 
     local challenge_id op difficulty mml_thresh dim
@@ -554,17 +668,27 @@ mine_cycle() {
     log_v "MML threshold: ${mml_thresh}"
 
     # 2. Mine (call Python engine; optional: op, path-layers, mml-threshold, explain)
+    # While mining, send progress every 3s so dashboard shows live activity (best-effort).
     log "Mining (max ${MAX_ITERATIONS} iterations)..."
     local mine_result
     local tmpfile
     tmpfile=$(mktemp)
     echo "$challenge" > "$tmpfile"
+    (
+        while true; do
+            send_progress "$challenge_id" "$(echo -n "${challenge_id}-$(date +%s)" | sha256sum | cut -c1-64)" "$DEVICE_ID" "$DEVICE_TYPE"
+            sleep 3
+        done
+    ) &
+    local progress_pid=$!
     mine_result=$(python3 -c "$MINE_PY" "$(cat "$tmpfile")" "$MINER_PUBKEY" "$MAX_ITERATIONS" "$MAX_TENSOR_DIM" \
         "${POT_OP:-}" "${POT_PATH_LAYERS:-32,16,8}" "${POT_MML_THRESHOLD:-}" "${POT_EXPLAIN:-0}" 2>&1) || {
+        kill "$progress_pid" 2>/dev/null; wait "$progress_pid" 2>/dev/null
         log_err "Mining engine error"
         rm -f "$tmpfile"
         return 1
     }
+    kill "$progress_pid" 2>/dev/null; wait "$progress_pid" 2>/dev/null
     rm -f "$tmpfile"
 
     # When --explain: print calculation steps (from Python stderr)
@@ -587,26 +711,43 @@ mine_cycle() {
         mml=$(echo "$json_line" | jq -r '.proof.mml_score')
         log_ok "Proof found!  nonce=${nonce}  path_distance=${dist}  mml_score=${mml}"
 
-        # 3. Submit (API: proof + optional signature; never use a keypair file as signature)
+        # 3. Submit (API: proof, optional signature, device_id, device_type)
         log "Submitting proof..."
         local proof_json submit_body submit_resp sig_json
         proof_json=$(echo "$json_line" | jq -c '.proof')
+        sig_json=""
         if [[ -n "${POT_SUBMIT_SIGNATURE:-}" ]]; then
             sig_json="$POT_SUBMIT_SIGNATURE"
-        elif [[ -f "${POT_MINER_JSON:-}" ]]; then
-            sig_json=$(jq -c '.' "${POT_MINER_JSON}" 2>/dev/null || true)
-        elif [[ -f "$(dirname "$0")/miner.json" ]]; then
-            sig_json=$(jq -c '.' "$(dirname "$0")/miner.json" 2>/dev/null || true)
-        elif [[ -f "miner.json" ]]; then
-            sig_json=$(jq -c '.' "miner.json" 2>/dev/null || true)
+        elif [[ -f "$MINER_JSON_PATH" ]]; then
+            if jq -e 'type == "object"' "$MINER_JSON_PATH" &>/dev/null; then
+                sig_json="[]"
+            else
+                sig_json=$(jq -c '.' "$MINER_JSON_PATH" 2>/dev/null || true)
+            fi
         fi
-        # Safety: Solana keypair (solana-keygen new -o miner.json) is 64 bytes — do NOT send as signature
-        if [[ -n "$sig_json" && "$(echo "$sig_json" | jq 'length')" == "64" ]]; then
-            log_warn "miner.json looks like a Solana keypair (64 bytes); not sending as signature (use -k \$(solana-keygen pubkey miner.json) for identity)"
+        if [[ -z "$sig_json" && -f "${POT_MINER_JSON:-}" && "${POT_MINER_JSON:-}" != "$MINER_JSON_PATH" ]]; then
+            sig_json=$(jq -c '.' "${POT_MINER_JSON}" 2>/dev/null || true)
+        fi
+        if [[ -z "$sig_json" && -f "$(dirname "$0")/miner.json" ]]; then
+            _f="$(dirname "$0")/miner.json"
+            if jq -e 'type == "object"' "$_f" &>/dev/null; then sig_json="[]"; else sig_json=$(jq -c '.' "$_f" 2>/dev/null || true); fi
+        fi
+        if [[ -z "$sig_json" && -f "miner.json" ]]; then
+            if jq -e 'type == "object"' "miner.json" &>/dev/null; then sig_json="[]"; else sig_json=$(jq -c '.' "miner.json" 2>/dev/null || true); fi
+        fi
+        if [[ -n "$sig_json" && "$(echo "$sig_json" | jq 'length' 2>/dev/null)" == "64" ]]; then
+            log_warn "miner.json looks like a Solana keypair (64 bytes); not sending as signature"
             sig_json="[]"
         fi
         sig_json="${sig_json:-[]}"
-        submit_body=$(jq -n --argjson proof "$proof_json" --argjson signature "$sig_json" '{"proof": $proof, "signature": $signature}')
+        if [[ -n "$DEVICE_ID" ]]; then
+            submit_body=$(jq -n --argjson proof "$proof_json" --argjson signature "$sig_json" \
+                --arg device_id "$DEVICE_ID" --arg device_type "$DEVICE_TYPE" \
+                '{"proof": $proof, "signature": $signature, "device_id": $device_id, "device_type": $device_type}')
+        else
+            submit_body=$(jq -n --argjson proof "$proof_json" --argjson signature "$sig_json" --arg device_type "$DEVICE_TYPE" \
+                '{"proof": $proof, "signature": $signature, "device_type": $device_type}')
+        fi
         submit_resp=$(rpc_post "/submit" "$submit_body") || {
             log_err "Submission request failed"
             STAT_PROOFS_SUBMITTED=$((STAT_PROOFS_SUBMITTED + 1))
@@ -614,11 +755,17 @@ mine_cycle() {
         }
         STAT_PROOFS_SUBMITTED=$((STAT_PROOFS_SUBMITTED + 1))
 
-        local accepted tx_sig
+        # ErrorResponse: ok=false, error=string; or success: accepted, tx_signature
+        local ok accepted tx_sig
+        ok=$(echo "$submit_resp" | jq -r '.ok // empty')
         accepted=$(echo "$submit_resp" | jq -r '.accepted // false')
         tx_sig=$(echo "$submit_resp" | jq -r '.tx_signature // "n/a"')
 
-        if [[ "$accepted" == "true" ]]; then
+        if [[ "$ok" == "false" ]]; then
+            local err_msg
+            err_msg=$(echo "$submit_resp" | jq -r '.error // "unknown"')
+            log_warn "Submit error: ${err_msg}"
+        elif [[ "$accepted" == "true" ]]; then
             STAT_PROOFS_ACCEPTED=$((STAT_PROOFS_ACCEPTED + 1))
             log_ok "${GREEN}${BOLD}ACCEPTED${NC}  tx: ${tx_sig}"
         else
@@ -703,6 +850,7 @@ main() {
     if [[ "$DASHBOARD" == "1" ]]; then
         export POT_RPC_URL="$RPC_URL" POT_MINER_PUBKEY="$MINER_PUBKEY"
         export POT_STATUS_URL="$STATUS_URL"
+        [[ -n "${POT_SOLANA_RPC_URL:-}" ]] && export POT_SOLANA_RPC_URL
         BINDIR="$(cd "$(dirname "$0")" && pwd)"
         exec python3 "${BINDIR}/pot-o-mine-dashboard.py"
     fi
