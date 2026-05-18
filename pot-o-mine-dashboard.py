@@ -25,6 +25,7 @@ RPC_URL = os.environ.get("POT_RPC_URL", "https://pot.rpc.gateway.tribewarez.com"
 # RPC Gateway Status API (all services status, PoT-O live, miners by device)
 STATUS_URL = os.environ.get("POT_STATUS_URL", "https://status.rpc.gateway.tribewarez.com").rstrip("/")
 MINER_PUBKEY = os.environ.get("POT_MINER_PUBKEY", "Cycv3ov14zd2dXMUfS2JPMz9r4bpQAPLfQDKxis2tjCg")
+HEXCHAIN = os.environ.get("POT_HEXCHAIN", "") == "1"
 REFRESH_SEC = 5
 TIMEOUT = 10
 
@@ -88,6 +89,14 @@ def get_pot_status():
     """Fallback: direct Pot RPC /status when Status API /api/live has no PoT-O data."""
     return fetch_pot("/status")
 
+def get_hexchain_status():
+    """GET /hexchain/status – hexchain lattice status."""
+    return fetch_pot("/hexchain/status")
+
+def get_hexchain_lattice():
+    """GET /hexchain/lattice – all hexchain blocks."""
+    return fetch_pot("/hexchain/lattice")
+
 
 def safe_get(obj, *keys, default="—"):
     for k in keys:
@@ -133,6 +142,9 @@ def run_dashboard(stdscr):
             data["peers"] = get_peers()
             data["devices"] = get_devices()
             data["miner"] = get_miner(MINER_PUBKEY) if MINER_PUBKEY else None
+            if HEXCHAIN:
+                data["hex_status"] = get_hexchain_status()
+                data["hex_lattice"] = get_hexchain_lattice()
             # Fallback: PoT-O data from direct RPC if /api/live didn't return pot_o
             api_live_raw = data.get("api_live", {})
             pot_o = api_live_raw.get("pot_o") if isinstance(api_live_raw, dict) else None
@@ -280,6 +292,43 @@ def run_dashboard(stdscr):
                 except curses.error:
                     pass
                 row += 1
+
+        # ── Hexchain (only when POT_HEXCHAIN=1)
+        if HEXCHAIN:
+            row += 1
+            try:
+                stdscr.addstr(row, 2, "── Hexchain Lattice ──", curses.A_BOLD)
+            except curses.error:
+                pass
+            row += 1
+            hs = data.get("hex_status", {})
+            if hs.get("_error"):
+                try:
+                    stdscr.addstr(row, 2, hs["_error"][:w - 4], curses.A_BOLD)
+                except curses.error:
+                    pass
+                row += 1
+            else:
+                try:
+                    stdscr.addstr(row, 2, "occupied: " + str(hs.get("occupied_coords", "?")) + "  depth: " + str(hs.get("latest_depth", "?")))
+                except curses.error:
+                    pass
+                row += 1
+                ch = hs.get("current_challenge")
+                if ch:
+                    try:
+                        stdscr.addstr(row, 2, "challenge: id=" + str(ch.get("id", "?"))[:24] + "  coord=" + json.dumps(ch.get("coord", {})))
+                    except curses.error:
+                        pass
+                    row += 1
+            hl = data.get("hex_lattice", {}).get("blocks", [])
+            if hl:
+                for b in hl[:4]:
+                    try:
+                        stdscr.addstr(row, 2, "  " + json.dumps(b.get("coord", {})) + "  depth=" + str(b.get("depth", "?")) + "  hash=" + str(b.get("block_hash", "?"))[:16])
+                    except curses.error:
+                        pass
+                    row += 1
 
         # ── Devices (Pot RPC GET /devices)
         row += 1

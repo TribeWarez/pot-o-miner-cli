@@ -65,6 +65,8 @@ ${BOLD}OPTIONS:${NC}
     --miner-info KEY       Print miner account for pubkey and exit
     --register-device JSON Register an ESP/external device (JSON body)
     --service-status ID    Print Status API single service (e.g. solana-rpc-proxy, pot-o-validator)
+    --hexchain             hexchain lattice PoW mode (uses /hexchain/* endpoints)
+    --hexchain-status      Show hexchain lattice status and exit
     -v, --verbose          Verbose output
     -h, --help             Show this help
 
@@ -103,6 +105,8 @@ DEVICES_ONLY=0
 MINER_INFO_KEY=""
 REGISTER_DEVICE_JSON=""
 SERVICE_STATUS_ID=""
+HEXCHAIN=0
+HEXCHAIN_STATUS_ONLY=0
 POT_OP="${POT_OPERATION:-}"
 POT_PATH_LAYERS="${POT_PATH_LAYERS:-32,16,8}"
 POT_MML_THRESHOLD="${POT_MML_THRESHOLD:-22}"
@@ -128,6 +132,8 @@ while [[ $# -gt 0 ]]; do
         --miner-info)         MINER_INFO_KEY="${2:-}"; shift 2 ;;
         --register-device)    REGISTER_DEVICE_JSON="${2:-}"; shift 2 ;;
         --service-status)     SERVICE_STATUS_ID="${2:-}"; shift 2 ;;
+        --hexchain)           HEXCHAIN=1; shift ;;
+        --hexchain-status)    HEXCHAIN_STATUS_ONLY=1; shift ;;
         -v|--verbose)         VERBOSE=1; shift ;;
         -h|--help)            usage ;;
         *)                    echo "Unknown option: $1"; usage ;;
@@ -274,6 +280,14 @@ show_status() {
     log "Fetching status from ${RPC_URL}..."
     local resp
     resp=$(rpc_get "/status") || { log_err "Cannot reach RPC"; exit 1; }
+    check_api_error "$resp" || exit 1
+    echo "$resp" | jq .
+}
+
+show_hexchain_status() {
+    log "Fetching hexchain status from ${RPC_URL}..."
+    local resp
+    resp=$(rpc_get "/hexchain/status") || { log_err "Cannot reach RPC"; exit 1; }
     check_api_error "$resp" || exit 1
     echo "$resp" | jq .
 }
@@ -628,6 +642,133 @@ if __name__ == "__main__":
 PYEOF
 )
 
+# ── hexchain Python mining engine ─────────────────────────────────────────────
+# Builds HexBlock from challenge, iterates nonces computing pow_hash, submits proof.
+HEX_MINE_PY=$(cat <<'PYEOF'
+import json, struct, hashlib, sys, math
+
+def sha256_once(data):
+    return hashlib.sha256(data).digest()
+
+def sha256_pair(a, b):
+    return sha256_once(a + b)
+
+def sha256_double_pair(a, b):
+    return sha256_once(sha256_pair(a, b))
+
+def merkle_root_neighbors(leaves):
+    level = list(leaves)
+    while len(level) > 1:
+        nxt = []
+        for i in range(0, len(level), 2):
+            if i + 1 < len(level):
+                nxt.append(sha256_double_pair(level[i], level[i+1]))
+            else:
+                nxt.append(sha256_double_pair(level[i], level[i]))
+        level = nxt
+    return level[0]
+
+def serialize_pow_preimage(block):
+    buf = bytearray()
+    buf.extend(block["parent_hash"])
+    buf.extend(block["tx_merkle_root"])
+    buf.extend(struct.pack("<Q", block["timestamp"]))
+    buf.extend(struct.pack("<Q", block["nonce"]))
+    buf.extend(struct.pack("<i", block["coord"][0]))
+    buf.extend(struct.pack("<i", block["coord"][1]))
+    buf.extend(struct.pack("<i", block["coord"][2]))
+    buf.extend(block["neighbor_merkle_root"])
+    buf.extend(struct.pack("<Q", block["tensor"]["expected_capacity"]))
+    buf.extend(struct.pack("<Q", block["tensor"]["actual_capacity"]))
+    buf.extend(struct.pack("<Q", block["tensor"]["compression_num"]))
+    buf.extend(struct.pack("<Q", block["tensor"]["compression_den"]))
+    return bytes(buf)
+
+def pow_hash(block):
+    return sha256_once(serialize_pow_preimage(block))
+
+def hex_mine(challenge_json, miner_pubkey, max_iterations):
+    c = json.loads(challenge_json)
+    target = bytes(c["target"])
+    coord = [c["coord"]["q"], c["coord"]["r"], c["coord"]["s"]]
+
+    # neighbor_hashes from challenge (list of lists of ints)
+    nb_hashes = []
+    for h in c["neighbor_hashes"]:
+        if isinstance(h, list):
+            nb_hashes.append(bytes(h))
+        elif isinstance(h, str):
+            nb_hashes.append(bytes.fromhex(h))
+        else:
+            nb_hashes.append(h)
+
+    # Compute neighbor merkle root (matches Rust HexBlock::neighbor_merkle_root)
+    nb_merkle = merkle_root_neighbors(nb_hashes)
+
+    # Build block template (nonce filled per iteration)
+    block_template = {
+        "parent_hash": nb_hashes[0] if nb_hashes else bytes(32),
+        "tx_merkle_root": bytes(32),
+        "timestamp": c.get("created_at_unix", 0),
+        "nonce": 0,
+        "coord": coord,
+        "neighbor_hashes": nb_hashes,
+        "neighbor_merkle_root": nb_merkle,
+        "tensor": {
+            "expected_capacity": 1000,
+            "actual_capacity": 1000,
+            "compression_num": 95,
+            "compression_den": 100,
+        },
+    }
+
+    pre_template = serialize_pow_preimage(block_template)
+    pre_prefix = pre_template[:72]       # bytes 0..71 (up to nonce exclusive)
+    pre_suffix = pre_template[80:]       # bytes 80..end (after nonce)
+
+    for nonce in range(max_iterations):
+        h = sha256_once(pre_prefix + struct.pack("<Q", nonce) + pre_suffix)
+        if h <= target:
+            block_template["nonce"] = nonce
+            import time
+            now = int(time.time())
+            proof = {
+                "challenge_id": c["id"],
+                "block": {
+                    "parent_hash": list(block_template["parent_hash"]),
+                    "tx_merkle_root": list(block_template["tx_merkle_root"]),
+                    "timestamp": block_template["timestamp"],
+                    "nonce": nonce,
+                    "coord": {"q": coord[0], "r": coord[1], "s": coord[2]},
+                    "neighbor_hashes": [list(x) for x in nb_hashes],
+                    "tensor": block_template["tensor"],
+                },
+                "miner_pubkey": miner_pubkey,
+                "timestamp_unix": now,
+            }
+            result = {
+                "status": "proof_found",
+                "proof": proof,
+                "block_hash": h.hex(),
+            }
+            print(json.dumps(result))
+            return
+
+        if nonce % 50000 == 0 and nonce > 0:
+            sys.stderr.write(f"  hex nonce={nonce}\n")
+
+    best = max(1, max_iterations)
+    result = {"status": "no_proof", "reason": "max_iterations_reached", "best_nonce": max_iterations}
+    print(json.dumps(result))
+
+if __name__ == "__main__":
+    challenge_json = sys.argv[1]
+    miner_pubkey = sys.argv[2]
+    max_iter = int(sys.argv[3])
+    hex_mine(challenge_json, miner_pubkey, max_iter)
+PYEOF
+)
+
 # ── Mining cycle ─────────────────────────────────────────────────────────────
 
 mine_cycle() {
@@ -783,6 +924,80 @@ mine_cycle() {
     fi
 }
 
+# ── hexchain mining cycle ─────────────────────────────────────────────────────
+
+hex_mine_cycle() {
+    log "Fetching hexchain challenge..."
+    local challenge_body
+    challenge_body=$(jq -n --arg slot "${POT_SLOT:-0}" --arg slot_hash "${POT_SLOT_HASH:-genesis}" \
+        '{slot: ($slot | tonumber), slot_hash: $slot_hash}')
+    local challenge
+    challenge=$(rpc_post "/hexchain/challenge" "$challenge_body") || {
+        log_err "Failed to fetch hexchain challenge"
+        return 1
+    }
+    check_api_error "$challenge" || return 1
+    STAT_CHALLENGES=$((STAT_CHALLENGES + 1))
+
+    local challenge_id
+    challenge_id=$(echo "$challenge" | jq -r '.id // "unknown"')
+    local target_hex
+    target_hex=$(echo "$challenge" | jq -r '.target // []')
+    log "HexChallenge: ${BOLD}${challenge_id:0:16}...${NC}  coord=$(echo "$challenge" | jq -c '.coord')  target=${target_hex:0:16}..."
+
+    log "Mining (max ${MAX_ITERATIONS} iterations)..."
+    local mine_result tmpfile
+    tmpfile=$(mktemp)
+    echo "$challenge" > "$tmpfile"
+    mine_result=$(python3 -c "$HEX_MINE_PY" "$(cat "$tmpfile")" "$MINER_PUBKEY" "$MAX_ITERATIONS" 2>&1) || {
+        log_err "hexchain mining engine error"
+        rm -f "$tmpfile"
+        return 1
+    }
+    rm -f "$tmpfile"
+
+    local json_line
+    json_line=$(echo "$mine_result" | grep '^{' | tail -1)
+    local status
+    status=$(echo "$json_line" | jq -r '.status // "error"')
+
+    if [[ "$status" == "proof_found" ]]; then
+        STAT_PROOFS_FOUND=$((STAT_PROOFS_FOUND + 1))
+        local nonce block_hash
+        nonce=$(echo "$json_line" | jq -r '.proof.block.nonce')
+        block_hash=$(echo "$json_line" | jq -r '.block_hash')
+        log_ok "Proof found!  nonce=${nonce}  block_hash=${block_hash:0:16}..."
+
+        log "Submitting hexchain proof..."
+        local proof_json submit_resp
+        proof_json=$(echo "$json_line" | jq -c '.proof')
+        submit_resp=$(rpc_post "/hexchain/submit" "$proof_json") || {
+            log_err "hexchain submission request failed"
+            STAT_PROOFS_SUBMITTED=$((STAT_PROOFS_SUBMITTED + 1))
+            return 1
+        }
+        STAT_PROOFS_SUBMITTED=$((STAT_PROOFS_SUBMITTED + 1))
+
+        local accepted depth
+        accepted=$(echo "$submit_resp" | jq -r '.accepted // false')
+        depth=$(echo "$submit_resp" | jq -r '.depth // "?"')
+        local bh
+        bh=$(echo "$submit_resp" | jq -r '.block_hash // "?"')
+        if [[ "$accepted" == "true" ]]; then
+            STAT_PROOFS_ACCEPTED=$((STAT_PROOFS_ACCEPTED + 1))
+            log_ok "${GREEN}${BOLD}ACCEPTED${NC}  depth=${depth}  block_hash=${bh:0:16}..."
+        else
+            local err_msg
+            err_msg=$(echo "$submit_resp" | jq -r '.error // "unknown"')
+            log_warn "Rejected: ${err_msg}"
+        fi
+    else
+        local reason
+        reason=$(echo "$json_line" | jq -r '.reason // "unknown"')
+        log_warn "No hex proof found (${reason})"
+    fi
+}
+
 print_stats() {
     local now elapsed
     now=$(date +%s)
@@ -823,6 +1038,10 @@ main() {
         show_status
         exit 0
     fi
+    if [[ "$HEXCHAIN_STATUS_ONLY" == "1" ]]; then
+        show_hexchain_status
+        exit 0
+    fi
     if [[ "$POOL_ONLY" == "1" ]]; then
         show_pool
         exit 0
@@ -850,13 +1069,27 @@ main() {
     if [[ "$DASHBOARD" == "1" ]]; then
         export POT_RPC_URL="$RPC_URL" POT_MINER_PUBKEY="$MINER_PUBKEY"
         export POT_STATUS_URL="$STATUS_URL"
+        [[ -n "${HEXCHAIN}" ]] && export POT_HEXCHAIN="$HEXCHAIN"
         [[ -n "${POT_SOLANA_RPC_URL:-}" ]] && export POT_SOLANA_RPC_URL
         BINDIR="$(cd "$(dirname "$0")" && pwd)"
         exec python3 "${BINDIR}/pot-o-mine-dashboard.py"
     fi
 
-    echo -e "${BOLD}"
-    cat <<'BANNER'
+    if [[ "$HEXCHAIN" == "1" ]]; then
+        echo -e "${BOLD}"
+        cat <<'BANNER'
+ _   _           _                          _
+| | | | _____  _| |__   ___  _ __          | |__   __ _ _ __   __ _
+| |_| |/ _ \ \/ / '_ \ / _ \| '_ \  ______ | '_ \ / _` | '_ \ / _` |
+|  _  |  __/>  <| | | | (_) | | | | |____| | | | | (_| | | | | (_| |
+|_| |_|\___/_/\_\_| |_|\___/|_| |_|        |_| |_|\__,_|_| |_|\__, |
+                                                               |___/
+BANNER
+        echo -e "${NC}"
+        log "MODE:      ${BOLD}hexchain lattice PoW${NC}"
+    else
+        echo -e "${BOLD}"
+        cat <<'BANNER'
               _              _
  _ __   ___ | |_       ___ | |   _ __ ___  _ __   ___
 | '_ \ / _ \| __|____ / _ \| |  | '_ ` _ \| '_ \ / _ \
@@ -864,12 +1097,15 @@ main() {
 | .__/ \___/ \__|     \___/(_)  |_| |_| |_|_| |_|\___|
 |_|                   Tribewarez PoT-O Desktop Miner
 BANNER
-    echo -e "${NC}"
+        echo -e "${NC}"
+    fi
 
     log "RPC:         ${BOLD}${RPC_URL}${NC}"
     log "Miner:       ${BOLD}${MINER_PUBKEY}${NC}"
     log "Iterations:  ${MAX_ITERATIONS}"
-    log "Max dim:     ${MAX_TENSOR_DIM}"
+    if [[ "$HEXCHAIN" != "1" ]]; then
+        log "Max dim:     ${MAX_TENSOR_DIM}"
+    fi
     echo ""
 
     # Health check
@@ -883,13 +1119,21 @@ BANNER
     echo ""
 
     if [[ "$ONCE" == "1" ]]; then
-        mine_cycle
+        if [[ "$HEXCHAIN" == "1" ]]; then
+            hex_mine_cycle
+        else
+            mine_cycle
+        fi
         print_stats
         exit 0
     fi
 
     while true; do
-        mine_cycle || true
+        if [[ "$HEXCHAIN" == "1" ]]; then
+            hex_mine_cycle || true
+        else
+            mine_cycle || true
+        fi
         print_stats
         log "Next cycle in ${LOOP_DELAY}s... (Ctrl+C to stop)"
         sleep "$LOOP_DELAY"
